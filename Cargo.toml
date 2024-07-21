@@ -1,0 +1,8 @@
+[workspace]
+members = ["blockchain-data"]
+# Only check / build main crates by default (check all with `--workspace`)
+default-members = ["blockchain-data"]
+resolver = "2"
+
+
+[workspace.dependencies]
