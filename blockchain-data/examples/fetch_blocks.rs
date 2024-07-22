@@ -1,4 +1,3 @@
-use alloy::eips::BlockNumberOrTag;
 use blockchain_data::{Ethereum, EthereumConfig};
 use futures::{pin_mut, StreamExt};
 use std::sync::Arc;
@@ -12,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Arc::new(Ethereum::try_new(config).await?);
 
-    let stream = client.fetch_blocks(1, BlockNumberOrTag::Latest).await?;
+    let stream = client.fetch_blocks(1, 20).await?;
 
     pin_mut!(stream);
 

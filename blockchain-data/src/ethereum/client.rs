@@ -1,8 +1,5 @@
-use std::time::Duration;
-
-use crate::ethereum::config::EthereumConfig;
+use super::EthereumConfig;
 use alloy::{
-    eips::BlockNumberOrTag,
     primitives::BlockNumber,
     providers::{Provider, ProviderBuilder, RootProvider, WsConnect},
     pubsub::PubSubFrontend,
@@ -12,12 +9,14 @@ use alloy::{
 use anyhow::Result;
 use async_stream::stream;
 use futures::{Stream, StreamExt};
-use tokio::{sync::mpsc, time::sleep};
+use std::{sync::Arc, time::Duration};
+use tokio::{sync::Mutex, time::sleep};
 
 // Ethereum is a struct that represents an Ethereum client.
 pub struct Ethereum {
     http_provider: Option<RootProvider<Http<Client>>>,
     ws_provider: Option<RootProvider<PubSubFrontend>>,
+    latest_block: Arc<Mutex<BlockNumber>>,
 }
 
 impl Ethereum {
@@ -36,10 +35,28 @@ impl Ethereum {
             None
         };
 
-        Ok(Ethereum {
+        let latest_block = Arc::new(Mutex::new(BlockNumber::MIN));
+        let latest_block_cloned = latest_block.clone();
+
+        let ethereum = Ethereum {
             http_provider,
             ws_provider,
-        })
+            latest_block,
+        };
+
+        if config.subscribe_latest_block {
+            let mut block_stream = ethereum.subscribe_blocks().await.unwrap();
+
+            tokio::spawn(async move {
+                while let Some(block) = block_stream.next().await {
+                    let block_number = block.header.number.unwrap();
+                    let mut latest_block_guard = latest_block_cloned.lock().await;
+                    *latest_block_guard = block_number;
+                }
+            });
+        }
+
+        Ok(ethereum)
     }
 
     pub async fn subscribe_blocks(&self) -> Result<impl Stream<Item = Block>> {
@@ -91,77 +108,36 @@ impl Ethereum {
 
     pub async fn fetch_blocks(
         &self,
-        start_block: BlockNumber,
-        end_block: impl Into<BlockNumberOrTag>,
+        start: BlockNumber,
+        confirmations: BlockNumber,
     ) -> Result<impl Stream<Item = Block> + '_> {
         if self.http_provider.is_none() {
             return Err(anyhow::anyhow!("HTTP provider not configured"));
         }
 
-        if self.ws_provider.is_none() {
-            return Err(anyhow::anyhow!("Websocket provider not configured"));
-        }
-
-        // Convert the end block into a block number
-        // and validate that it is a valid block number
-        // or 'latest'
-        // if it is invalid, return an error
-        let end_block = end_block.into();
-
-        if !end_block.is_number() && !end_block.is_latest() {
-            return Err(anyhow::anyhow!(
-                "Invalid end block, must be a number or 'latest'"
-            ));
-        }
-
-        let (tx, mut rx) = mpsc::channel::<Block>(1);
-        let mut block_stream = self.subscribe_blocks().await.unwrap();
-
-        tokio::spawn(async move {
-            while let Some(block) = block_stream.next().await {
-                if tx.send(block).await.is_err() {
-                    break;
-                }
-            }
-        });
-
         let client = self.http_provider.as_ref().unwrap();
-        let latest_block = client.get_block_number().await?;
-        let mut end_block_num;
-        let mut current_block = start_block;
-
-        // Get the latest block number
-        if end_block.is_number() {
-            end_block_num = end_block.as_number().unwrap();
-        } else {
-            end_block_num = latest_block;
-        }
+        let latest_block_cloned = self.latest_block.clone();
+        let mut current_block = start;
 
         // Create a stream of blocks
         let block_stream = stream! {
             loop {
-                let duration = if end_block.is_latest() {
-                    match rx.recv().await {
-                        Some(block) if current_block > end_block_num => {
-                            end_block_num = block.header.number.unwrap();
-                            Duration::from_millis(800)
-                        },
-                        _ => Duration::from_millis(100),
-                    }
-                } else if current_block > end_block_num {
-                    break;
+                let latest_block = *latest_block_cloned.lock().await;
+
+                if latest_block < confirmations || current_block > latest_block - confirmations {
+                    sleep(Duration::from_millis(1000)).await;
                 } else {
-                    Duration::from_millis(100)
+                    let ret = client.get_block_by_number(current_block.into(), false).await;
+
+                    if let Ok(Some(block)) = ret {
+                        yield block;
+                        current_block += 1;
+                    } else {
+                        println!("Failed to get block by number: {:?}", current_block);
+                    }
+
+                    sleep(Duration::from_millis(100)).await;
                 };
-
-                sleep(duration).await;
-
-                let ret = client.get_block_by_number(current_block.into(), false).await;
-
-                if let Ok(Some(block)) = ret {
-                    yield block;
-                    current_block += 1;
-                }
             }
         };
 
