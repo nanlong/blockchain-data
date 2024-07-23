@@ -142,11 +142,13 @@ fn check_rpc_url(rpc_url: &RpcUrl, duration: Duration, timeout: Duration, tx: Se
                 "ws" | "wss" => {
                     let ws = WsConnect::new(url);
                     let provider = ProviderBuilder::new().on_ws(ws).await.map_err(|_err| {
+                        let status = RequestStatus::Failure;
                         rpc_url.uptime.offline(duration);
+                        rpc_url.success_rate.update(&status);
 
                         let new_rpc_url = RpcUrl {
                             request_time: Some(SystemTime::now()),
-                            request_status: Some(RequestStatus::Failure),
+                            request_status: Some(status),
                             ..rpc_url.clone()
                         };
 
@@ -165,18 +167,19 @@ fn check_rpc_url(rpc_url: &RpcUrl, duration: Duration, timeout: Duration, tx: Se
 
             rpc_url.latency.update(latency);
 
-            let request_status = if height.is_ok() {
+            let status = if height.is_ok() {
                 rpc_url.uptime.online(duration);
                 RequestStatus::Success
             } else {
                 rpc_url.uptime.offline(duration);
                 RequestStatus::Failure
             };
+            rpc_url.success_rate.update(&status);
 
             let rpc_url = RpcUrl {
                 height: height.ok(),
                 request_time: Some(SystemTime::now()),
-                request_status: Some(request_status),
+                request_status: Some(status),
                 ..rpc_url.clone()
             };
 
@@ -191,12 +194,14 @@ fn check_rpc_url(rpc_url: &RpcUrl, duration: Duration, timeout: Duration, tx: Se
         match ret {
             // if task timeout, update the RpcUrl status to timeout
             Err(_) => {
-                rpc_url.latency.update(timeout);
+                let status = RequestStatus::Timeout;
                 rpc_url.uptime.offline(timeout);
+                rpc_url.latency.update(timeout);
+                rpc_url.success_rate.update(&status);
 
                 let rpc_url = RpcUrl {
                     request_time: Some(SystemTime::now()),
-                    request_status: Some(RequestStatus::Timeout),
+                    request_status: Some(status),
                     ..rpc_url
                 };
 
@@ -221,7 +226,7 @@ enum RequestStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Latency {
-    request_count: u32,
+    total_count: u32,
     max_latency: Duration,
     min_latency: Duration,
     avg_latency: Duration,
@@ -231,7 +236,7 @@ struct Latency {
 impl Latency {
     fn new() -> Self {
         Latency {
-            request_count: 0,
+            total_count: 0,
             max_latency: Duration::from_secs(0),
             min_latency: Duration::from_secs(u64::MAX),
             avg_latency: Duration::from_secs(0),
@@ -240,11 +245,10 @@ impl Latency {
     }
 
     fn update(&mut self, latency: Duration) {
-        self.request_count += 1;
+        self.total_count += 1;
         self.max_latency = self.max_latency.max(latency);
         self.min_latency = self.min_latency.min(latency);
-        self.avg_latency =
-            (self.avg_latency * (self.request_count - 1) + latency) / self.request_count;
+        self.avg_latency = (self.avg_latency * (self.total_count - 1) + latency) / self.total_count;
         self.latest_latency = latency;
     }
 
@@ -292,12 +296,10 @@ impl Uptime {
     }
 
     fn percentage(&self) -> f64 {
-        let value = self.online_time.as_secs_f64() / self.total_time.as_secs_f64() * 100.0;
-
-        if value.is_nan() {
+        if self.total_time.as_secs() == 0 {
             0.0
         } else {
-            value
+            self.online_time.as_secs_f64() / self.total_time.as_secs_f64() * 100.0
         }
     }
 
@@ -311,7 +313,45 @@ impl Uptime {
     }
 }
 
-// 在线时间（Uptime）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuccessRate {
+    total_count: u32,
+    success_count: u32,
+}
+
+impl SuccessRate {
+    fn new() -> Self {
+        SuccessRate {
+            total_count: 0,
+            success_count: 0,
+        }
+    }
+
+    fn update(&mut self, status: &RequestStatus) {
+        self.total_count += 1;
+        if status == &RequestStatus::Success {
+            self.success_count += 1;
+        }
+    }
+
+    fn percentage(&self) -> f64 {
+        if self.total_count == 0 {
+            0.0
+        } else {
+            self.success_count as f64 / self.total_count as f64 * 100.0
+        }
+    }
+
+    fn score(&self) -> u8 {
+        match self.percentage() {
+            99.9..=100.0 => 10,
+            99.5..=99.9 => 9,
+            99.0..=99.5 => 8,
+            _ => 7,
+        }
+    }
+}
+
 // 请求成功率（Success Rate）
 #[derive(Clone, PartialEq, Eq)]
 pub struct RpcUrl {
@@ -319,6 +359,7 @@ pub struct RpcUrl {
     height: Option<BlockNumber>,
     latency: Latency,
     uptime: Uptime,
+    success_rate: SuccessRate,
     request_time: Option<SystemTime>,
     request_status: Option<RequestStatus>,
     score: u64,
@@ -331,6 +372,7 @@ impl RpcUrl {
             height: None,
             latency: Latency::new(),
             uptime: Uptime::new(),
+            success_rate: SuccessRate::new(),
             request_time: None,
             request_status: None,
             score: 0,
@@ -338,7 +380,7 @@ impl RpcUrl {
     }
 
     fn score(&self) -> u64 {
-        (7 * self.latency.score() + 3 * self.uptime.score()) as u64
+        (4 * self.uptime.score() + 3 * self.latency.score() + 3 * self.success_rate.score()) as u64
     }
 }
 
@@ -349,6 +391,7 @@ impl Debug for RpcUrl {
             .field("height", &self.height)
             .field("latency", &self.latency.avg_latency.as_secs_f32())
             .field("uptime", &self.uptime.percentage())
+            .field("success_rate", &self.success_rate.percentage())
             .field("request_time", &self.request_time)
             .field("request_status", &self.request_status)
             .field("score", &self.score())
@@ -382,7 +425,7 @@ impl Ord for RpcUrl {
         // height 相同时，按 score score 越大优先级越高
         match self.height.cmp(&other.height) {
             Ordering::Equal => self.score().cmp(&other.score()),
-            other => other.reverse(),
+            ordering => ordering,
         }
     }
 }
