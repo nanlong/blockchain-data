@@ -1,4 +1,3 @@
-use crate::utils::get_timestamp;
 use alloy::{
     primitives::BlockNumber,
     providers::{Provider, ProviderBuilder, WsConnect},
@@ -9,7 +8,7 @@ use std::{
     collections::{BinaryHeap, HashSet},
     fmt::{self, Debug},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     sync::{
@@ -107,7 +106,7 @@ impl RpcUrlList {
                 let mut urls_guard = urls.lock().await;
 
                 for rpc_url in urls_guard.iter() {
-                    check_rpc_url(rpc_url, timeout, tx.clone());
+                    check_rpc_url(rpc_url, duration, timeout, tx.clone());
                 }
 
                 // drop tx to close the channel
@@ -126,7 +125,7 @@ impl RpcUrlList {
     }
 }
 
-fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
+fn check_rpc_url(rpc_url: &RpcUrl, duration: Duration, timeout: Duration, tx: Sender<RpcUrl>) {
     let mut rpc_url = rpc_url.to_owned().clone();
     let url = rpc_url.url.clone();
 
@@ -143,11 +142,15 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
                 "ws" | "wss" => {
                     let ws = WsConnect::new(url);
                     let provider = ProviderBuilder::new().on_ws(ws).await.map_err(|_err| {
-                        SendError(RpcUrl {
-                            request_time: Some(get_timestamp()),
+                        rpc_url.uptime.offline(duration);
+
+                        let new_rpc_url = RpcUrl {
+                            request_time: Some(SystemTime::now()),
                             request_status: Some(RequestStatus::Failure),
                             ..rpc_url.clone()
-                        })
+                        };
+
+                        SendError(new_rpc_url)
                     })?;
                     let start = Instant::now();
                     let height = provider.get_block_number().await;
@@ -163,14 +166,16 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
             rpc_url.latency.update(latency);
 
             let request_status = if height.is_ok() {
+                rpc_url.uptime.online(duration);
                 RequestStatus::Success
             } else {
+                rpc_url.uptime.offline(duration);
                 RequestStatus::Failure
             };
 
             let rpc_url = RpcUrl {
                 height: height.ok(),
-                request_time: Some(get_timestamp()),
+                request_time: Some(SystemTime::now()),
                 request_status: Some(request_status),
                 ..rpc_url.clone()
             };
@@ -183,17 +188,24 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
         // set timeout for task
         let ret = time::timeout(timeout, task).await;
 
-        // if task timeout, update the RpcUrl status to timeout
-        if ret.is_err() {
-            rpc_url.latency.update(timeout);
+        match ret {
+            // if task timeout, update the RpcUrl status to timeout
+            Err(_) => {
+                rpc_url.latency.update(timeout);
+                rpc_url.uptime.offline(timeout);
 
-            let rpc_url = RpcUrl {
-                request_time: Some(get_timestamp()),
-                request_status: Some(RequestStatus::Timeout),
-                ..rpc_url
-            };
+                let rpc_url = RpcUrl {
+                    request_time: Some(SystemTime::now()),
+                    request_status: Some(RequestStatus::Timeout),
+                    ..rpc_url
+                };
 
-            tx.send(rpc_url).await?;
+                tx.send(rpc_url).await?;
+            }
+            Ok(Err(SendError(rpc_url))) => {
+                tx.send(rpc_url).await?;
+            }
+            _ => {}
         }
 
         Ok::<(), SendError<RpcUrl>>(())
@@ -205,7 +217,6 @@ enum RequestStatus {
     Success,
     Failure,
     Timeout,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +266,51 @@ impl fmt::Display for Latency {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Uptime {
+    start_time: Instant,
+    total_time: Duration,
+    online_time: Duration,
+}
+
+impl Uptime {
+    fn new() -> Self {
+        Uptime {
+            start_time: Instant::now(),
+            total_time: Duration::from_secs(0),
+            online_time: Duration::from_secs(0),
+        }
+    }
+
+    fn online(&mut self, duration: Duration) {
+        self.total_time += duration;
+        self.online_time += duration;
+    }
+
+    fn offline(&mut self, duration: Duration) {
+        self.total_time += duration;
+    }
+
+    fn percentage(&self) -> f64 {
+        let value = self.online_time.as_secs_f64() / self.total_time.as_secs_f64() * 100.0;
+
+        if value.is_nan() {
+            0.0
+        } else {
+            value
+        }
+    }
+
+    fn score(&self) -> u8 {
+        match self.percentage() {
+            99.9..=100.0 => 10,
+            99.5..=99.9 => 9,
+            99.0..=99.5 => 8,
+            _ => 7,
+        }
+    }
+}
+
 // 在线时间（Uptime）
 // 请求成功率（Success Rate）
 #[derive(Clone, PartialEq, Eq)]
@@ -262,7 +318,8 @@ pub struct RpcUrl {
     url: Url,
     height: Option<BlockNumber>,
     latency: Latency,
-    request_time: Option<u64>,
+    uptime: Uptime,
+    request_time: Option<SystemTime>,
     request_status: Option<RequestStatus>,
     score: u64,
 }
@@ -273,6 +330,7 @@ impl RpcUrl {
             url,
             height: None,
             latency: Latency::new(),
+            uptime: Uptime::new(),
             request_time: None,
             request_status: None,
             score: 0,
@@ -280,7 +338,7 @@ impl RpcUrl {
     }
 
     fn score(&self) -> u64 {
-        self.latency.score() as u64
+        (7 * self.latency.score() + 3 * self.uptime.score()) as u64
     }
 }
 
@@ -288,16 +346,11 @@ impl Debug for RpcUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RpcUrl")
             .field("url", &self.url.to_string())
-            .field("height", &self.height.unwrap_or(0))
+            .field("height", &self.height)
             .field("latency", &self.latency.avg_latency.as_secs_f32())
-            .field("request_time", &self.request_time.unwrap_or(0))
-            .field(
-                "request_status",
-                &self
-                    .request_status
-                    .as_ref()
-                    .unwrap_or(&RequestStatus::Unknown),
-            )
+            .field("uptime", &self.uptime.percentage())
+            .field("request_time", &self.request_time)
+            .field("request_status", &self.request_status)
             .field("score", &self.score())
             .finish()
     }
@@ -329,7 +382,7 @@ impl Ord for RpcUrl {
         // height 相同时，按 score score 越大优先级越高
         match self.height.cmp(&other.height) {
             Ordering::Equal => self.score().cmp(&other.score()),
-            other => other,
+            other => other.reverse(),
         }
     }
 }
