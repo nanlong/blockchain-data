@@ -7,7 +7,7 @@ use alloy::{
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashSet},
-    fmt::Debug,
+    fmt::{self, Debug},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -127,7 +127,7 @@ impl RpcUrlList {
 }
 
 fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
-    let rpc_url = rpc_url.to_owned().clone();
+    let mut rpc_url = rpc_url.to_owned().clone();
     let url = rpc_url.url.clone();
 
     tokio::spawn(async move {
@@ -144,7 +144,6 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
                     let ws = WsConnect::new(url);
                     let provider = ProviderBuilder::new().on_ws(ws).await.map_err(|_err| {
                         SendError(RpcUrl {
-                            latency: None,
                             request_time: Some(get_timestamp()),
                             request_status: Some(RequestStatus::Failure),
                             ..rpc_url.clone()
@@ -161,6 +160,8 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
                 ),
             };
 
+            rpc_url.latency.update(latency);
+
             let request_status = if height.is_ok() {
                 RequestStatus::Success
             } else {
@@ -169,7 +170,6 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
 
             let rpc_url = RpcUrl {
                 height: height.ok(),
-                latency: Some(latency),
                 request_time: Some(get_timestamp()),
                 request_status: Some(request_status),
                 ..rpc_url.clone()
@@ -185,8 +185,9 @@ fn check_rpc_url(rpc_url: &RpcUrl, timeout: Duration, tx: Sender<RpcUrl>) {
 
         // if task timeout, update the RpcUrl status to timeout
         if ret.is_err() {
+            rpc_url.latency.update(timeout);
+
             let rpc_url = RpcUrl {
-                latency: None,
                 request_time: Some(get_timestamp()),
                 request_status: Some(RequestStatus::Timeout),
                 ..rpc_url
@@ -207,13 +208,63 @@ enum RequestStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Latency {
+    request_count: u32,
+    max_latency: Duration,
+    min_latency: Duration,
+    avg_latency: Duration,
+    latest_latency: Duration,
+}
+
+impl Latency {
+    fn new() -> Self {
+        Latency {
+            request_count: 0,
+            max_latency: Duration::from_secs(0),
+            min_latency: Duration::from_secs(u64::MAX),
+            avg_latency: Duration::from_secs(0),
+            latest_latency: Duration::from_secs(0),
+        }
+    }
+
+    fn update(&mut self, latency: Duration) {
+        self.request_count += 1;
+        self.max_latency = self.max_latency.max(latency);
+        self.min_latency = self.min_latency.min(latency);
+        self.avg_latency =
+            (self.avg_latency * (self.request_count - 1) + latency) / self.request_count;
+        self.latest_latency = latency;
+    }
+
+    fn score(&self) -> u8 {
+        match self.avg_latency.as_millis() {
+            0..=100 => 10,
+            101..=200 => 9,
+            201..=500 => 8,
+            501..=1000 => 7,
+            _ => 6,
+        }
+    }
+}
+
+impl fmt::Display for Latency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let latency = self.latest_latency.as_millis() as f64 / 1000.0;
+        write!(f, "{:?}", latency.to_string() + "s")
+    }
+}
+
+// 在线时间（Uptime）
+// 请求成功率（Success Rate）
 #[derive(Clone, PartialEq, Eq)]
 pub struct RpcUrl {
     url: Url,
     height: Option<BlockNumber>,
-    latency: Option<Duration>,
+    latency: Latency,
     request_time: Option<u64>,
     request_status: Option<RequestStatus>,
+    score: u64,
 }
 
 impl RpcUrl {
@@ -221,10 +272,15 @@ impl RpcUrl {
         RpcUrl {
             url,
             height: None,
-            latency: None,
+            latency: Latency::new(),
             request_time: None,
             request_status: None,
+            score: 0,
         }
+    }
+
+    fn score(&self) -> u64 {
+        self.latency.score() as u64
     }
 }
 
@@ -233,7 +289,7 @@ impl Debug for RpcUrl {
         f.debug_struct("RpcUrl")
             .field("url", &self.url.to_string())
             .field("height", &self.height.unwrap_or(0))
-            .field("latency", &self.latency.unwrap_or(Duration::from_secs(0)))
+            .field("latency", &self.latency.avg_latency.as_secs_f32())
             .field("request_time", &self.request_time.unwrap_or(0))
             .field(
                 "request_status",
@@ -242,6 +298,7 @@ impl Debug for RpcUrl {
                     .as_ref()
                     .unwrap_or(&RequestStatus::Unknown),
             )
+            .field("score", &self.score())
             .finish()
     }
 }
@@ -268,17 +325,10 @@ impl Ord for RpcUrl {
             return Ordering::Greater;
         }
 
-        if self.latency.is_none() {
-            return Ordering::Less;
-        }
-        if other.latency.is_none() {
-            return Ordering::Greater;
-        }
-
         // 按 height 排序，height 越大优先级越高
-        // height 相同时，按 latency 排序，latency 越小优先级越高
+        // height 相同时，按 score score 越大优先级越高
         match self.height.cmp(&other.height) {
-            Ordering::Equal => self.latency.cmp(&other.latency).reverse(),
+            Ordering::Equal => self.score().cmp(&other.score()),
             other => other,
         }
     }

@@ -65,15 +65,12 @@ impl Ethereum {
         }
 
         // Subscribe to new blocks
-        let subscription = self
-            .ws_provider
-            .as_ref()
-            .unwrap()
-            .subscribe_blocks()
-            .await?;
+        let client = self.ws_provider.as_ref().unwrap();
+        let subscription = client.subscribe_blocks().await?;
+        let block_stream = subscription.into_stream();
 
         // Return the stream of blocks
-        Ok(subscription.into_stream())
+        Ok(block_stream)
     }
 
     pub async fn watch_blocks(&self) -> Result<impl Stream<Item = Block> + '_> {
