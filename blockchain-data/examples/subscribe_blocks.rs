@@ -12,13 +12,14 @@ async fn main() -> anyhow::Result<()> {
     let client = Arc::new(Ethereum::try_new(config).await?);
     let subscribe_client = client.clone();
     let watch_client = client.clone();
+    let update_client = client.clone();
 
     let subscribe_task = tokio::spawn(async move {
         let stream = subscribe_client.subscribe_blocks().await?;
 
         pin_mut!(stream);
 
-        while let Some(block) = stream.next().await {
+        while let Some(Ok(block)) = stream.next().await {
             println!("Subscribe Block Number: {:?}", block.header.number);
         }
 
@@ -30,9 +31,22 @@ async fn main() -> anyhow::Result<()> {
 
         pin_mut!(stream);
 
-        while let Some(block) = stream.next().await {
-            println!("Watch Block Number: {:?}", block.header.number);
+        while let Some(ret) = stream.next().await {
+            match ret {
+                Ok(block) => println!("Watch Block Number: {:?}", block.header.number),
+                Err(e) => println!("Watch Block Error: {:?}", e),
+            }
         }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        update_client
+            .update_ws_provider("ws://localhost:8545")
+            .await?;
 
         Ok::<(), anyhow::Error>(())
     });
