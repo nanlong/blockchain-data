@@ -352,7 +352,6 @@ impl SuccessRate {
     }
 }
 
-// 请求成功率（Success Rate）
 #[derive(Clone, PartialEq, Eq)]
 pub struct RpcUrl {
     url: Url,
