@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use derive_builder::Builder;
 use url::Url;
 
@@ -9,6 +11,8 @@ pub struct EthereumConfig {
     pub(crate) ws_url: Option<Url>,
     #[builder(default = "true")]
     pub(crate) subscribe_latest_block: bool,
+    #[builder(default = "Duration::from_secs(1)")]
+    pub(crate) timeout: Duration,
 }
 
 impl EthereumConfig {

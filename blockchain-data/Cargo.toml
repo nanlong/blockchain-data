@@ -5,7 +5,7 @@ authors = ["Jeff <fei.code@gmail.com>"]
 edition = "2021"
 
 [dependencies]
-alloy = { version = "0.2.0", features = ["full", "node-bindings"] }
+alloy = { version = "0.2.0", features = ["full"] }
 anyhow = "1.0.86"
 async-stream = "0.3.5"
 derive_builder = "0.20.0"

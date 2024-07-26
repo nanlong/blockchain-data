@@ -1,5 +1,5 @@
 use blockchain_data::{Ethereum, EthereumConfig};
-use futures::{pin_mut, StreamExt};
+use futures::StreamExt;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -15,9 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let update_client = client.clone();
 
     let subscribe_task = tokio::spawn(async move {
-        let stream = subscribe_client.subscribe_blocks().await?;
-
-        pin_mut!(stream);
+        let mut stream = subscribe_client.subscribe_blocks().await?;
 
         while let Some(Ok(block)) = stream.next().await {
             println!("Subscribe Block Number: {:?}", block.header.number);
@@ -27,9 +25,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let watch_task = tokio::spawn(async move {
-        let stream = watch_client.watch_blocks().await?;
-
-        pin_mut!(stream);
+        let mut stream = watch_client.watch_blocks().await?;
 
         while let Some(ret) = stream.next().await {
             match ret {

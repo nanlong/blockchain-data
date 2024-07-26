@@ -1,5 +1,5 @@
 use blockchain_data::{Ethereum, EthereumConfig};
-use futures::{pin_mut, StreamExt};
+use futures::StreamExt;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -11,11 +11,9 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Arc::new(Ethereum::try_new(config).await?);
 
-    let stream = client.fetch_blocks(1, 20).await?;
+    let mut stream = client.fetch_blocks(1, 20).await?;
 
-    pin_mut!(stream);
-
-    while let Some(block) = stream.next().await {
+    while let Some(Ok(block)) = stream.next().await {
         println!("Block Number: {:?}", block.header.number);
     }
 

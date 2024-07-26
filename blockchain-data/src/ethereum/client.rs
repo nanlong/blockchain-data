@@ -6,14 +6,16 @@ use alloy::{
     rpc::types::{Block, BlockTransactionsKind},
     transports::http::{Client, Http},
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_stream::stream;
-use futures::{pin_mut, Stream, StreamExt};
-use std::{sync::Arc, time::Duration};
+use futures::{Stream, StreamExt};
+use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{watch, Mutex},
     time::{sleep, timeout},
 };
+
+pub type BlockStream = Pin<Box<dyn Stream<Item = Result<Block>> + Send>>;
 
 // Ethereum is a struct that represents an Ethereum client.
 pub struct Ethereum {
@@ -58,20 +60,18 @@ impl Ethereum {
             latest_block,
             http_provider_tx,
             ws_provider_tx,
-            timeout: Duration::from_secs(10),
+            timeout: config.timeout,
         };
 
         if config.subscribe_latest_block {
-            // pin_mut!(block_stream);
-            let block_stream = ethereum.subscribe_blocks().await?;
+            let mut block_stream = ethereum.subscribe_blocks().await?;
 
             tokio::spawn(async move {
-                pin_mut!(block_stream);
-
                 while let Some(Ok(block)) = block_stream.next().await {
-                    let block_number = block.header.number.unwrap();
-                    let mut latest_block_guard = latest_block_cloned.lock().await;
-                    *latest_block_guard = block_number;
+                    if let Some(block_number) = block.header.number {
+                        let mut latest_block_guard = latest_block_cloned.lock().await;
+                        *latest_block_guard = block_number;
+                    }
                 }
             });
         }
@@ -80,34 +80,36 @@ impl Ethereum {
     }
 
     pub async fn update_http_provider(&self, url: &str) -> Result<()> {
-        if self.http_provider_tx.is_none() {
-            return Err(anyhow::anyhow!("HTTP provider not configured"));
-        }
+        let tx = self
+            .http_provider_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("HTTP provider not configured"))?;
 
-        let provider = ProviderBuilder::new().on_http(url.parse()?);
-        let tx = self.http_provider_tx.as_ref().unwrap();
+        let url = url.parse()?;
+        let provider = ProviderBuilder::new().on_http(url);
         tx.send(provider)?;
         Ok(())
     }
 
     pub async fn update_ws_provider(&self, url: &str) -> Result<()> {
-        if self.ws_provider_tx.is_none() {
-            return Err(anyhow::anyhow!("Websocket provider not configured"));
-        }
+        let tx = self
+            .ws_provider_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Websocket provider not configured"))?;
 
-        let ws = WsConnect::new(url);
-        let provider = ProviderBuilder::new().on_ws(ws).await?;
-        let tx = self.ws_provider_tx.as_ref().unwrap();
+        let connect = WsConnect::new(url);
+        let provider = ProviderBuilder::new().on_ws(connect).await?;
         tx.send(provider)?;
         Ok(())
     }
 
-    pub async fn subscribe_blocks(&self) -> Result<impl Stream<Item = Result<Block>>> {
-        if self.ws_provider_tx.is_none() {
-            return Err(anyhow::anyhow!("Websocket provider not configured"));
-        }
+    pub async fn subscribe_blocks(&self) -> Result<BlockStream> {
+        let mut rx = self
+            .ws_provider_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("Websocket provider not configured"))?
+            .subscribe();
 
-        let mut rx = self.ws_provider_tx.as_ref().unwrap().subscribe();
         let duration = self.timeout;
 
         let block_stream = stream! {
@@ -133,15 +135,15 @@ impl Ethereum {
         };
 
         // Return the stream of blocks
-        Ok(block_stream)
+        Ok(Box::pin(block_stream))
     }
 
-    pub async fn watch_blocks(&self) -> Result<impl Stream<Item = Result<Block>> + '_> {
-        if self.http_provider_tx.is_none() {
-            return Err(anyhow::anyhow!("HTTP provider not configured"));
-        }
-
-        let mut rx = self.http_provider_tx.as_ref().unwrap().subscribe();
+    pub async fn watch_blocks(&self) -> Result<BlockStream> {
+        let mut rx = self
+            .http_provider_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("HTTP provider not configured"))?
+            .subscribe();
         let duration = self.timeout;
 
         let block_stream = stream! {
@@ -177,21 +179,22 @@ impl Ethereum {
         };
 
         // Return the stream of blocks
-        Ok(block_stream)
+        Ok(Box::pin(block_stream))
     }
 
     pub async fn fetch_blocks(
         &self,
         start: BlockNumber,
         confirmations: BlockNumber,
-    ) -> Result<impl Stream<Item = Block> + '_> {
-        if self.http_provider_tx.is_none() {
-            return Err(anyhow::anyhow!("HTTP provider not configured"));
-        }
-
+    ) -> Result<BlockStream> {
+        let mut rx = self
+            .http_provider_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("HTTP provider not configured"))?
+            .subscribe();
         let latest_block_cloned = self.latest_block.clone();
         let mut current_block = start;
-        let mut rx = self.http_provider_tx.as_ref().unwrap().subscribe();
+
         let duration = self.timeout;
 
         let block_stream = stream! {
@@ -211,7 +214,7 @@ impl Ethereum {
                         let ret = timeout(duration, provider.get_block_by_number(current_block.into(), false)).await;
 
                         if let Ok(Ok(Some(block))) = ret {
-                            yield block;
+                            yield Ok(block);
                             current_block += 1;
                         } else {
                             break;
@@ -228,6 +231,6 @@ impl Ethereum {
         };
 
         // Return the stream of blocks
-        Ok(block_stream)
+        Ok(Box::pin(block_stream))
     }
 }
