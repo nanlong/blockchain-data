@@ -25,14 +25,18 @@ use url::Url;
 
 #[derive(Debug)]
 pub struct RpcUrlList {
-    // urls 为 rpc url 的优先级队列，优先级由 RpcUrl 的 height 和 latency 决定
-    urls: Arc<Mutex<BinaryHeap<RpcUrl>>>,
+    // // chain_id 为链的 id
+    // chain_id: u64,
+    // // latest_block 为链的最新区块高度
+    // latest_block: Option<BlockNumber>,
     // duration 为 rpc url 的健康检查间隔时间
     duration: Duration,
     // timeout 为 rpc url 的超时时间, 超时后会更新 rpc url 的状态为 timeout
     timeout: Duration,
     // buffer_size 为 rpc url 的数量, 用于设置 mpsc channel 的缓冲区大小
     buffer_size: usize,
+    // urls 为 rpc url 的优先级队列，优先级由 RpcUrl 的 height 和 latency 决定
+    urls: Arc<Mutex<BinaryHeap<RpcUrl>>>,
 }
 
 impl RpcUrlList {
